@@ -1,0 +1,10 @@
+[package]
+name = "rustgpt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+rand = "0.8"
+candle-core = { version = "0.8", features = ["metal"] }
+candle-nn = { version = "0.8", features = ["metal"] }
