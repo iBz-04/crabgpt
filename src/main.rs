@@ -4,6 +4,7 @@ use candle_nn as nn;
 use candle_nn::{Module, Optimizer};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::{Rng, SeedableRng};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 
@@ -22,24 +23,28 @@ struct Config {
     seed: u64,
     max_new_tokens: usize,
     vocab_size: usize,
+    temperature: f32,
+    top_k: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             batch_size: 32,
-            block_size: 128,
-            max_iters: 3000,
-            eval_interval: 500,
-            eval_iters: 200,
+            block_size: 256,
+            max_iters: 8000,
+            eval_interval: 1000,
+            eval_iters: 100,
             learning_rate: 3e-4,
             n_embd: 192,
             n_head: 6,
             n_layer: 4,
-            dropout: 0.2,
+            dropout: 0.1,
             seed: 1337,
             max_new_tokens: 500,
             vocab_size: 0,
+            temperature: 0.9,
+            top_k: 40,
         }
     }
 }
@@ -251,10 +256,23 @@ impl FeedForward {
 
     fn forward_t(&self, x: &Tensor, train: bool) -> Result<Tensor> {
         let x = self.fc1.forward(x)?;
-        let x = x.relu()?;
+        let x = gelu(&x)?;
         let x = self.fc2.forward(&x)?;
         Ok(self.dropout.forward(&x, train)?)
     }
+}
+
+fn gelu(x: &Tensor) -> Result<Tensor> {
+    // Approximate GELU used in GPT-2: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+    let x3 = x.powf(3.0)?;                         // Tensor
+    let x3_scaled = (x3 * 0.044715)?;             // Result -> Tensor after ?
+    let inner_pre = (x + x3_scaled)?;             // Result -> Tensor
+    let inner = (inner_pre * 0.7978845608028654)?; // Result -> Tensor
+    let tanh = inner.tanh()?;                      // Tensor -> Result
+    let a = (x * 0.5)?;                            // Tensor
+    let b = (tanh + 1.0)?;                         // Tensor
+    let out = (a * b)?;                            // Result -> Tensor
+    Ok(out)
 }
 
 struct Block {
@@ -326,10 +344,21 @@ fn generate(
     model: &GPT,
     cfg: &Config,
     device: &Device,
-    itos: &[char],
+    data: &Dataset,
     rng: &mut impl Rng,
 ) -> Result<String> {
-    let mut idx = vec![0u32];
+    let seed_len = cfg.block_size.min(64);
+    let mut idx = if seed_len > 0 && data.train.len() >= seed_len {
+        let max_start = data.train.len() - seed_len;
+        let start = if max_start > 0 {
+            rng.gen_range(0..max_start)
+        } else {
+            0
+        };
+        data.train[start..start + seed_len].to_vec()
+    } else {
+        vec![0u32]
+    };
     for _ in 0..cfg.max_new_tokens {
         let start = idx.len().saturating_sub(cfg.block_size);
         let idx_cond = &idx[start..];
@@ -339,14 +368,58 @@ fn generate(
             .narrow(1, idx_cond.len() - 1, 1)?
             .squeeze(1)?
             .squeeze(0)?;
-        let probs = nn::ops::softmax(&last, D::Minus1)?;
-        let probs = probs.to_device(&Device::Cpu)?;
-        let probs = probs.to_vec1::<f32>()?;
+        let mut logits = last.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        let temp = cfg.temperature.max(1e-4);
+        for v in &mut logits {
+            *v /= temp;
+        }
+        apply_top_k(&mut logits, cfg.top_k);
+        let probs = softmax_cpu(&logits);
         let dist = WeightedIndex::new(&probs)?;
         let next_id = dist.sample(rng) as u32;
         idx.push(next_id);
     }
-    Ok(decode(&idx, itos))
+    Ok(decode(&idx, &data.itos))
+}
+
+fn apply_top_k(logits: &mut [f32], top_k: usize) {
+    if top_k == 0 || top_k >= logits.len() {
+        return;
+    }
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.select_nth_unstable_by(top_k - 1, |&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(Ordering::Equal)
+    });
+    let cutoff = logits[idx[top_k - 1]];
+    for v in logits {
+        if *v < cutoff {
+            *v = f32::NEG_INFINITY;
+        }
+    }
+}
+
+fn softmax_cpu(logits: &[f32]) -> Vec<f32> {
+    let max = logits
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut exps = Vec::with_capacity(logits.len());
+    let mut sum = 0.0f32;
+    for &v in logits {
+        let e = (v - max).exp();
+        exps.push(e);
+        sum += e;
+    }
+    if sum == 0.0 {
+        let uniform = 1.0 / logits.len() as f32;
+        return vec![uniform; logits.len()];
+    }
+    for v in &mut exps {
+        *v /= sum;
+    }
+    exps
 }
 
 fn save_model(varmap: &nn::VarMap, path: &str) -> Result<()> {
@@ -355,8 +428,9 @@ fn save_model(varmap: &nn::VarMap, path: &str) -> Result<()> {
     
     for (idx, var) in varmap.all_vars().iter().enumerate() {
         let tensor = var.as_tensor().to_device(&Device::Cpu)?;
-        let data = tensor.to_vec1::<f32>()?;
         let shape = tensor.shape().dims().to_vec();
+        let flat = tensor.reshape((tensor.elem_count(),))?;
+        let data = flat.to_vec1::<f32>()?;
         
         // Convert f32 to bytes
         let bytes: Vec<u8> = data.iter()
@@ -434,7 +508,7 @@ fn main() -> Result<()> {
         opt.backward_step(&loss)?;
     }
 
-    let sample = generate(&model, &cfg, &device, &data.itos, &mut rng)?;
+    let sample = generate(&model, &cfg, &device, &data, &mut rng)?;
     println!("{sample}");
 
     save_model(&varmap, "model.safetensors")?;
