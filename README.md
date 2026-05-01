@@ -1,4 +1,4 @@
-# RustGPT - A Transformer Language Model in Rust
+# RustGPT 
 
 A character-level GPT (Generative Pre-trained Transformer) implementation in Rust using the HuggingFace Candle framework with Metal acceleration for Apple Silicon.
 
@@ -185,6 +185,3 @@ Measures how wrong our predictions are. Optimizer (AdamW) adjusts weights to min
 - [ ] Mixed precision training
 - [ ] Export to ONNX format
 
-## License
-
-MIT
