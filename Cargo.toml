@@ -8,3 +8,5 @@ anyhow = "1"
 rand = "0.8"
 candle-core = { version = "0.8", features = ["metal"] }
 candle-nn = { version = "0.8", features = ["metal"] }
+safetensors = "0.4"
+serde_json = "1"

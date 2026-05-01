@@ -349,6 +349,43 @@ fn generate(
     Ok(decode(&idx, itos))
 }
 
+fn save_model(varmap: &nn::VarMap, path: &str) -> Result<()> {
+    // Convert all variables to CPU and collect data
+    let mut tensors = Vec::new();
+    
+    for (idx, var) in varmap.all_vars().iter().enumerate() {
+        let tensor = var.as_tensor().to_device(&Device::Cpu)?;
+        let data = tensor.to_vec1::<f32>()?;
+        let shape = tensor.shape().dims().to_vec();
+        
+        // Convert f32 to bytes
+        let bytes: Vec<u8> = data.iter()
+            .flat_map(|f| f.to_le_bytes().to_vec())
+            .collect();
+        
+        tensors.push((idx.to_string(), shape, bytes));
+    }
+    
+    // Save as simple JSON metadata + binary data
+    let metadata: Vec<(String, Vec<usize>)> = tensors
+        .iter()
+        .map(|(name, shape, _)| (name.clone(), shape.clone()))
+        .collect();
+    
+    let metadata_json = serde_json::to_string(&metadata)?;
+    fs::write(&format!("{}.meta.json", path), metadata_json)?;
+    
+    // Save all tensor data concatenated
+    let mut all_data = Vec::new();
+    for (_, _, bytes) in &tensors {
+        all_data.extend_from_slice(bytes);
+    }
+    fs::write(path, &all_data)?;
+    
+    println!("✓ Model saved to {} ({} parameters)", path, all_data.len() / 4);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut cfg = Config::default();
     let data = build_dataset("input.txt")?;
@@ -399,6 +436,8 @@ fn main() -> Result<()> {
 
     let sample = generate(&model, &cfg, &device, &data.itos, &mut rng)?;
     println!("{sample}");
+
+    save_model(&varmap, "model.safetensors")?;
 
     Ok(())
 }
